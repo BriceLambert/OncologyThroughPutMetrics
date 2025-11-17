@@ -1,0 +1,165 @@
+
+WITH raw_data AS (
+    SELECT
+        v.PatientEncounterID
+        ,v.PatientID
+        ,v.AppointmentDTS
+        ,v.CheckInDTS
+        , r.RoomingDTS
+        ,r.EventNM AS RoomingEventNM
+        ,d.PtDischargeDTS
+        ,d.VisitEndDTS
+        ,tc.TxStartedDTS
+        ,tc.TxCompleteDTS
+        ,me2.InitialEncounterFLG
+    FROM SAM.ClinicalInfusion.PopulationVisit AS v
+    LEFT OUTER JOIN SAM.ClinicalInfusion.PreMetricThroughputRooming AS r
+        ON r.PatientEncounterID = v.PatientEncounterID
+    LEFT OUTER JOIN SAM.ClinicalInfusion.PreMetricThroughputVisitEnd AS d
+        ON d.PatientEncounterID = v.PatientEncounterID
+    LEFT OUTER JOIN sam.ClinicalInfusion.PreMetricThroughputTxStartComplete tc
+        ON v.PatientEncounterID = tc.PatientEncounterID
+    LEFT OUTER JOIN SAM.ClinicalInfusion.PreMetricThroughputMultipleEncounters AS me2
+        ON me2.PatientEncounterID = v.PatientEncounterID
+)
+,starts AS (
+    SELECT
+        PatientEncounterID
+        ,CASE WHEN RoomingDTS >= CheckInDTS THEN RoomingDTS ELSE NULL END AS AdjustedRoomingDTS
+        ,CASE WHEN TxStartedDTS is not null AND TxStartedDTS >= (CASE WHEN RoomingDTS >= CheckInDTS THEN RoomingDTS ELSE NULL END) THEN TxStartedDTS
+             ELSE CASE WHEN (CASE WHEN RoomingDTS >= CheckInDTS THEN RoomingDTS ELSE NULL END) IS NOT NULL THEN (CASE WHEN RoomingDTS >= CheckInDTS THEN RoomingDTS ELSE NULL END) ELSE NULL END
+        END AS ChairTimeStartDTS
+    FROM raw_data
+)
+
+,ends AS (
+    SELECT
+        r.PatientEncounterID
+        , s.AdjustedRoomingDTS
+        , s.ChairTimeStartDTS
+        ,CASE WHEN TxCompleteDTS IS NOT NULL 
+              AND TxCompleteDTS >= ChairTimeStartDTS 
+              AND (AdjustedRoomingDTS IS NULL OR TxCompleteDTS > AdjustedRoomingDTS) THEN TxCompleteDTS
+             ELSE CASE WHEN VisitEndDTS IS NOT NULL 
+                       AND VisitEndDTS >= ChairTimeStartDTS
+                       AND (AdjustedRoomingDTS IS NULL OR VisitEndDTS > AdjustedRoomingDTS) THEN VisitEndDTS ELSE NULL END
+        END AS ChairTimeEndDTS
+
+        ,CASE WHEN TxCompleteDTS IS NOT NULL 
+              AND (ChairTimeStartDTS is null or TxCompleteDTS > ChairTimeStartDTS)
+              AND  (AdjustedRoomingDTS IS NULL OR TxCompleteDTS > AdjustedRoomingDTS) 
+            THEN TxCompleteDTS
+             ELSE CASE WHEN VisitEndDTS IS NOT NULL 
+                       AND (ChairTimeStartDTS is null or VisitEndDTS > ChairTimeStartDTS)
+                        and (AdjustedRoomingDTS IS NULL OR VisitEndDTS > AdjustedRoomingDTS) 
+                        THEN VisitEndDTS
+                  ELSE CASE WHEN PtDischargeDTS IS NOT NULL 
+                            and (ChairTimeStartDTS is null or PtDischargeDTS > ChairTimeStartDTS)
+                            and (AdjustedRoomingDTS IS NULL OR PtDischargeDTS > AdjustedRoomingDTS) 
+                            THEN PtDischargeDTS 
+                            ELSE NULL END
+             END
+        END AS VisitLengthEndDTS
+    FROM raw_data r 
+    INNER JOIN starts s 
+        ON r.PatientEncounterID = s.PatientEncounterID
+)
+,validated AS (
+    SELECT
+        r.PatientEncounterID
+        ,r.PatientID
+        ,r.AppointmentDTS
+        ,r.CheckInDTS
+        ,r.RoomingDTS
+        ,e.AdjustedRoomingDTS
+        ,r.RoomingEventNM
+        ,r.PtDischargeDTS
+        ,r.VisitEndDTS
+        ,r.TxStartedDTS
+        ,r.TxCompleteDTS
+        ,r.InitialEncounterFLG
+        ,e.ChairTimeStartDTS
+        ,e.ChairTimeEndDTS
+        ,e.VisitLengthEndDTS
+        ,CASE WHEN (e.AdjustedRoomingDTS IS NOT NULL AND e.ChairTimeEndDTS IS NOT NULL AND e.AdjustedRoomingDTS >= e.ChairTimeEndDTS) 
+              OR (e.AdjustedRoomingDTS IS NOT NULL AND e.VisitLengthEndDTS IS NOT NULL AND e.AdjustedRoomingDTS >= e.VisitLengthEndDTS) 
+              THEN NULL 
+              ELSE e.AdjustedRoomingDTS 
+         END AS ValidatedAdjustedRoomingDTS
+    FROM raw_data r 
+    INNER JOIN ends e 
+        ON r.PatientEncounterID = e.PatientEncounterID
+)
+,violations AS (
+    SELECT
+        PatientEncounterID
+        ,PatientID
+        ,AppointmentDTS
+        ,CheckInDTS
+        ,RoomingDTS
+        ,AdjustedRoomingDTS
+        ,RoomingEventNM
+        ,PtDischargeDTS
+        ,VisitEndDTS
+        ,TxStartedDTS
+        ,TxCompleteDTS
+        ,InitialEncounterFLG
+        ,ChairTimeStartDTS
+        ,ChairTimeEndDTS
+        ,VisitLengthEndDTS
+        ,ValidatedAdjustedRoomingDTS
+        ,CASE WHEN ValidatedAdjustedRoomingDTS IS NULL THEN 1 ELSE 0 END AS WaitTimeViolationNBR
+        ,CASE WHEN ChairTimeEndDTS IS NULL THEN 1 ELSE 0 END AS ChairTimeViolationNBR
+        ,CASE WHEN VisitLengthEndDTS IS NULL THEN 1 ELSE 0 END AS VisitLengthViolationNBR
+    FROM validated
+)
+SELECT
+    PatientEncounterID
+    ,PatientID
+    ,AppointmentDTS
+    ,CheckInDTS
+    ,RoomingDTS
+    , AdjustedRoomingDTS
+    ,RoomingEventNM
+    ,PtDischargeDTS
+    ,VisitEndDTS
+    ,TxStartedDTS
+    ,TxCompleteDTS
+    ,ChairTimeStartDTS
+    ,ChairTimeEndDTS
+    ,VisitLengthEndDTS
+    ,CASE WHEN  WaitTimeViolationNBR = 0 
+                AND ValidatedAdjustedRoomingDTS IS NOT NULL 
+                    THEN DATEDIFF(MINUTE, CheckInDTS, ValidatedAdjustedRoomingDTS) ELSE NULL 
+    END AS WaitTimeNBR
+
+    ,CASE WHEN  WaitTimeViolationNBR = 0 
+                AND ValidatedAdjustedRoomingDTS IS NOT NULL 
+                    THEN IIF(InitialEncounterFLG = 'Y' OR InitialEncounterFLG IS NULL, DATEDIFF(MINUTE, CheckInDTS, ValidatedAdjustedRoomingDTS), NULL) 
+          ELSE NULL 
+     END AS InitialOnlyWaitTimeNBR
+
+    ,CASE WHEN  ChairTimeViolationNBR = 0 
+                AND ChairTimeEndDTS IS NOT NULL 
+                AND ChairTimeStartDTS IS NOT NULL 
+                AND ChairTimeEndDTS > ChairTimeStartDTS 
+                    THEN DATEDIFF(MINUTE, ChairTimeStartDTS, ChairTimeEndDTS) ELSE NULL 
+    END AS ChairTimeNBR
+
+    ,CASE WHEN  VisitLengthViolationNBR = 0 
+                AND VisitLengthEndDTS IS NOT NULL 
+                AND VisitLengthEndDTS > CheckInDTS 
+                    THEN DATEDIFF(MINUTE, CheckInDTS, VisitLengthEndDTS) ELSE NULL 
+    END AS VisitLengthNBR
+
+    ,CASE
+        WHEN TxCompleteDTS IS NOT NULL THEN '1000003: Tx Complete'
+        WHEN VisitEndDTS IS NOT NULL THEN '604: Visit End'
+        WHEN PtDischargeDTS IS NOT NULL THEN '1000004: Patient Discharged'
+        ELSE NULL
+    END AS EndingEventNM
+    ,InitialEncounterFLG
+    ,WaitTimeViolationNBR
+    ,ChairTimeViolationNBR
+    ,VisitLengthViolationNBR
+FROM violations;
